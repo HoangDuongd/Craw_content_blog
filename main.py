@@ -23,6 +23,10 @@ class CrawlRequest(BaseModel):
     from_date: Optional[str] = None
     to_date: Optional[str] = None
     content_type: Optional[str] = "text"  # hoặc "html"
+    country: Optional[str] = "us"         # thêm country
+    domains: Optional[str] = None         # thêm domain (cho NewsAPI)
+    exclude_domains: Optional[str] = None # thêm exclude_domains (cho NewsAPI)
+
 
 
 # ==== Adapter interface ====
@@ -75,7 +79,17 @@ class GNewsAdapter(NewsAPIAdapter):
 class NewsAPIOrgAdapter(NewsAPIAdapter):
     def __init__(self, api_key):
         self.api_key = api_key
-        self.base_url = "https://newsapi.org/v2/everything"
+        self.base_url = "https://newsapi.org/v2/everything"    
+
+
+### NewsAPI has some methods of searching
+## everything == find every url that adapted request
+## headlines == find and response the news that is hot and have searched most
+## source == return source of news (response is not a blog)
+
+
+
+
 
     def get_articles(self, query, **kwargs):
         params = {
@@ -84,10 +98,16 @@ class NewsAPIOrgAdapter(NewsAPIAdapter):
             'pageSize': kwargs.get('max', 10),
             'apiKey': self.api_key
         }
+            # Thêm các tham số tùy chọn
         if kwargs.get('from_date'):
             params['from'] = kwargs['from_date']
         if kwargs.get('to_date'):
             params['to'] = kwargs['to_date']
+        if kwargs.get('domains'):
+            params['domains'] = kwargs['domains']  # vd: "cnn.com,bbc.co.uk"
+        if kwargs.get('exclude_domains'):
+            params['excludeDomains'] = kwargs['exclude_domains']  # vd: "foxnews.com"
+
         try:
             response = requests.get(self.base_url, params=params, timeout=10)
             response.raise_for_status()
@@ -171,8 +191,10 @@ def crawl_news(data: CrawlRequest):
         data.queries,
         lang=data.lang,
         max=data.max,
+        country=data.country,
         from_date=data.from_date,
-        to_date=data.to_date
+        to_date=data.to_date,
+        domain=data.domains
     )
 
     urls = [a['url'] for a in articles]
@@ -188,5 +210,5 @@ def crawl_news(data: CrawlRequest):
         "query_count": len(data.queries),
         "article_count": len(articles),
         "time_taken": f"{duration:.2f} sec",
-        "articles": articles[:10]  # Trả về tối đa 10 bài, tránh quá nặng
+        "articles": articles  # Trả về tối đa 10 bài, tránh quá nặng
     }
