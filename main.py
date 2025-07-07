@@ -210,10 +210,16 @@ def crawl_news(data: CrawlRequest):
 
     duration = time.time() - start_time
 
-    return {
-        "status": "success",
-        "query_count": len(data.queries),
-        "article_count": len(articles),
-        "time_taken": f"{duration:.2f} sec",
-        "articles": articles
-    }
+    # Tạo danh sách bài viết chỉ gồm các trường cần thiết
+    table_articles = [
+        {
+            "title": a.get("title", ""),
+            "source": a.get("source", ""),
+            "content": a.get("content", "")
+        }
+        for a in articles
+    ]
+
+    # Trả về danh sách trực tiếp
+    return table_articles
+
