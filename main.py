@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-NEWS_API = '898c89c237e243599b404ebd48f2b6a3'
-GNEWS_API = '3dd8a59498ec187ddeae7e78d573d108'
+NEWS_API = '15186bd948c4451db8359e094ab45c18'
+GNEWS_API = '13e512c12a5c7382dfd42e8be50c0e7a'
 
 class CrawlRequest(BaseModel):
     queries: List[str]
