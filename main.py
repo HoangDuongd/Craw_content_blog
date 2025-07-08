@@ -3,11 +3,16 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 import time
-from newspaper import Article
 import requests
 import concurrent.futures
 import asyncio
 import logging
+import re
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import unicodedata
+from newspaper import Article
+from abc import ABC, abstractmethod
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -24,12 +29,13 @@ class CrawlRequest(BaseModel):
     max: Optional[int] = 10
     from_date: Optional[str] = None
     to_date: Optional[str] = None
-    content_type: Optional[str] = "text"
+    content_type: Optional[str] = "html"  # Đổi default thành "html"
     country: Optional[List[str]] = ["us"]
     domains: Optional[List[str]] = None
     exclude_domains: Optional[List[str]] = None
+    return_html: Optional[bool] = True
+    return_images: Optional[bool] = True
 
-# Add health check endpoints
 @app.get("/")
 async def root():
     return {"message": "News Crawler API is running", "status": "healthy"}
@@ -38,16 +44,116 @@ async def root():
 async def health_check():
     return {"status": "healthy", "message": "Server is running"}
 
-from abc import ABC, abstractmethod
+def generate_slug(title):
+    if not title:
+        return ""
+    title = re.sub(r'<[^>]+>', '', title)
+    slug = title.lower()
+    slug = unicodedata.normalize('NFKD', slug).encode('ascii', 'ignore').decode('ascii')
+    slug = re.sub(r'[^\w\s-]', '', slug)
+    slug = re.sub(r'[-\s]+', '-', slug).strip('-')
+    return slug[:100]
+
+def clean_html_content(html):
+    """Improved HTML cleaning with better preservation"""
+    if not html:
+        return ""
+    
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+        
+        # Remove unwanted tags but preserve content structure
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "iframe", "form"]):
+            tag.decompose()
+        
+        # Remove inline styles and classes but keep structure
+        for tag in soup.find_all():
+            for attr in ['style', 'class', 'id', 'onclick', 'onload']:
+                tag.attrs.pop(attr, None)
+        
+        # Only remove truly empty tags (no text and no images)
+        empty_tags = soup.find_all(lambda tag: tag.name in ['div', 'span', 'p'] and 
+                                  not tag.get_text(strip=True) and 
+                                  not tag.find(['img', 'video', 'audio']))
+        for tag in empty_tags:
+            tag.decompose()
+        
+        # Get the body content if exists, otherwise full content
+        body = soup.find('body')
+        if body:
+            content = str(body)
+        else:
+            content = str(soup)
+        
+        # Clean up whitespace
+        content = re.sub(r'\s+', ' ', content)
+        content = re.sub(r'>\s+<', '><', content)
+        
+        logger.info(f"HTML cleaned, length: {len(content)}")
+        return content.strip()
+        
+    except Exception as e:
+        logger.error(f"Error cleaning HTML: {e}")
+        return html  # Return original if cleaning fails
+
+def extract_images(article_url, html_content):
+    if not html_content:
+        return []
+    
+    try:
+        soup = BeautifulSoup(html_content, 'lxml')
+        images = []
+        
+        for img in soup.find_all('img'):
+            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+            if src:
+                # Convert to absolute URL
+                if src.startswith('//'):
+                    src = 'https:' + src
+                elif src.startswith('/'):
+                    base_url = f"{urlparse(article_url).scheme}://{urlparse(article_url).netloc}"
+                    src = urljoin(base_url, src)
+                elif not src.startswith('http'):
+                    src = urljoin(article_url, src)
+                
+                # Filter out small/unwanted images
+                if any(k in src.lower() for k in ['icon', 'logo', 'avatar', 'ad', 'banner']):
+                    continue
+                
+                # Check if image has reasonable size attributes
+                width = img.get('width')
+                height = img.get('height')
+                if width and height:
+                    try:
+                        w, h = int(width), int(height)
+                        if w < 100 or h < 100:  # Skip small images
+                            continue
+                    except ValueError:
+                        pass
+                
+                # Get alt text
+                alt_text = img.get('alt', '').strip()
+                
+                # Create simplified image object (only url and alt)
+                image_obj = {
+                    'url': src,
+                    'alt': alt_text
+                }
+                
+                images.append(image_obj)
+        
+        return images
+    except Exception as e:
+        logger.error(f"Error extracting images: {e}")
+        return []
+
 
 class NewsAPIAdapter(ABC):
     @abstractmethod
-    def get_articles(self, query, **kwargs):
-        pass
+    def get_articles(self, query, **kwargs): pass
 
     @abstractmethod
-    def format_response(self, response):
-        pass
+    def format_response(self, response): pass
 
 class GNewsAdapter(NewsAPIAdapter):
     def __init__(self, api_key):
@@ -55,10 +161,7 @@ class GNewsAdapter(NewsAPIAdapter):
         self.base_url = "https://gnews.io/api/v4/search"
 
     def get_articles(self, query, **kwargs):
-        country = kwargs.get('country', ['us'])
-        if isinstance(country, list):
-            country = country[0]
-
+        country = kwargs.get('country', ['us'])[0]
         params = {
             'q': query,
             'token': self.api_key,
@@ -67,23 +170,22 @@ class GNewsAdapter(NewsAPIAdapter):
             'max': kwargs.get('max', 10)
         }
         try:
-            # Tăng timeout và thêm retry logic
-            response = requests.get(self.base_url, params=params, timeout=30)
-            response.raise_for_status()
-            return self.format_response(response.json())
-        except requests.RequestException as e:
+            r = requests.get(self.base_url, params=params, timeout=30)
+            r.raise_for_status()
+            return self.format_response(r.json())
+        except Exception as e:
             logger.error(f"[GNews ERROR]: {e}")
             return []
 
     def format_response(self, response):
-        articles = response.get('articles', [])
         return [{
-            'title': a.get('title'),
+            'title': a.get('title', ''),
             'url': a.get('url'),
             'source': 'GNews',
             'publishedAt': a.get('publishedAt'),
-            'description': a.get('description', '')
-        } for a in articles if a.get('url')]
+            'description': a.get('description', ''),
+            'image': a.get('image', '')
+        } for a in response.get('articles', []) if a.get('url')]
 
 class NewsAPIOrgAdapter(NewsAPIAdapter):
     def __init__(self, api_key):
@@ -97,7 +199,6 @@ class NewsAPIOrgAdapter(NewsAPIAdapter):
             'pageSize': kwargs.get('max', 10),
             'apiKey': self.api_key
         }
-
         if kwargs.get('from_date'):
             params['from'] = kwargs['from_date']
         if kwargs.get('to_date'):
@@ -106,46 +207,96 @@ class NewsAPIOrgAdapter(NewsAPIAdapter):
             params['domains'] = ",".join(kwargs['domains'])
         if kwargs.get('exclude_domains'):
             params['excludeDomains'] = ",".join(kwargs['exclude_domains'])
-
         try:
-            # Tăng timeout
-            response = requests.get(self.base_url, params=params, timeout=30)
-            response.raise_for_status()
-            return self.format_response(response.json())
-        except requests.RequestException as e:
+            r = requests.get(self.base_url, params=params, timeout=30)
+            r.raise_for_status()
+            return self.format_response(r.json())
+        except Exception as e:
             logger.error(f"[NewsAPI ERROR]: {e}")
             return []
 
     def format_response(self, response):
-        if response.get('status') != 'ok':
+        if response.get('status') != 'ok': 
             return []
-        articles = response.get('articles', [])
         return [{
-            'title': a.get('title'),
+            'title': a.get('title', ''),
             'url': a.get('url'),
             'source': a.get('source', {}).get('name', 'NewsAPI'),
             'publishedAt': a.get('publishedAt'),
-            'description': a.get('description', '')
-        } for a in articles if a.get('url')]
+            'description': a.get('description', ''),
+            'image': a.get('urlToImage', '')
+        } for a in response.get('articles', []) if a.get('url')]
 
-def get_content_from_urls(urls, content_type='text'):
-    contents = []
-    for url in urls:
+class ContentExtractor:
+    def __init__(self, content_type='html', return_html=True, return_images=True):
+        self.content_type = content_type
+        self.return_html = return_html
+        self.return_images = return_images
+
+    def extract(self, article_data):
+        url = article_data.get('url')
+        logger.info(f"Extracting content from: {url}")
+        
         try:
+            # Download article
             article = Article(url)
             article.download()
             article.parse()
-            if content_type == 'html':
-                contents.append(article.html)
+            
+            # Debug: Log what we got
+            logger.info(f"Article downloaded, HTML length: {len(article.html) if article.html else 0}")
+            logger.info(f"Article text length: {len(article.text) if article.text else 0}")
+            
+            # Extract content based on type
+            if self.content_type == 'html':
+                if article.html:
+                    content = clean_html_content(article.html)
+                    logger.info(f"HTML content extracted, length: {len(content)}")
+                else:
+                    content = article.text or ""
+                    logger.warning(f"No HTML found, using text instead for: {url}")
             else:
-                contents.append(article.text)
+                content = article.text or ""
+            
+            # Extract images
+            extracted_images = []
+            
+            if self.return_images:
+                if article.html:
+                    extracted_images = extract_images(url, article.html)
+                    logger.info(f"Extracted {len(extracted_images)} images")
+                else:
+                    logger.warning(f"No HTML for image extraction: {url}")
+            
+            # Generate slug
+            slug = generate_slug(article_data.get('title') or article_data.get('description') or url)
+            
+            result = {
+                'title': article_data.get('title', ''),
+                'slug': slug,
+                'description': article_data.get('description', '') or article.meta_description or '',
+                'content': content,
+                'content_type': self.content_type,
+                'url': url,
+                'images': extracted_images if self.return_images else []
+            }
+            
+            return result
+            
         except Exception as e:
             logger.error(f"[Content ERROR for {url}]: {e}")
-            contents.append("")
-    return contents
-
+            return {
+                'title': article_data.get('title', ''),
+                'slug': generate_slug(article_data.get('title', '')),
+                'description': article_data.get('description', ''),
+                'content': '',
+                'content_type': self.content_type,
+                'url': url,
+                'images': [],
+                'error': str(e)  # Debug info
+            }
 class NewsAggregator:
-    def __init__(self, max_workers=2):  # Giảm max_workers
+    def __init__(self, max_workers=2):
         self.adapters = [GNewsAdapter(GNEWS_API), NewsAPIOrgAdapter(NEWS_API)]
         self.max_workers = max_workers
 
@@ -154,128 +305,100 @@ class NewsAggregator:
         exclude_domains = kwargs.get("exclude_domains") or []
 
         def fetch_query(query):
-            articles = []
+            results = []
             for adapter in self.adapters:
                 try:
-                    articles += adapter.get_articles(query, **kwargs)
+                    articles = adapter.get_articles(query, **kwargs)
+                    results.extend(articles)
+                    logger.info(f"Got {len(articles)} articles from {adapter.__class__.__name__} for query: {query}")
                 except Exception as e:
-                    logger.error(f"Error fetching query '{query}': {e}")
-            return articles
+                    logger.error(f"Error with {adapter.__class__.__name__}: {e}")
+            return results
 
-        # Giảm số workers để tránh overload
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [executor.submit(fetch_query, q) for q in queries]
             for f in concurrent.futures.as_completed(futures):
                 try:
-                    all_articles += f.result()
+                    all_articles.extend(f.result())
                 except Exception as e:
-                    logger.error(f"Error processing future: {e}")
+                    logger.error(f"Error processing query: {e}")
 
-        filtered_articles = self.remove_duplicates(all_articles)
-
+        unique_articles = self.remove_duplicates(all_articles)
         if exclude_domains:
-            filtered_articles = self.filter_excluded_domains(filtered_articles, exclude_domains)
-
-        return filtered_articles
+            unique_articles = self.filter_excluded_domains(unique_articles, exclude_domains)
+        
+        logger.info(f"Total unique articles: {len(unique_articles)}")
+        return unique_articles
 
     def remove_duplicates(self, articles):
         seen = set()
-        unique = []
-        for article in articles:
-            url = article.get("url")
+        result = []
+        for a in articles:
+            url = a.get("url")
             if url and url not in seen:
                 seen.add(url)
-                unique.append(article)
-        return unique
+                result.append(a)
+        return result
 
     def filter_excluded_domains(self, articles, exclude_domains):
-        def is_excluded(url):
-            for domain in exclude_domains:
-                if domain in url:
-                    return True
-            return False
+        return [a for a in articles if not any(domain in a.get("url", "") for domain in exclude_domains)]
 
-        return [article for article in articles if not is_excluded(article.get("url", ""))]
-
-# Sử dụng async để tránh blocking
 @app.post("/crawl-news")
 async def crawl_news(data: CrawlRequest):
     try:
         logger.info(f"[INFO] Received query: {data.queries}")
-        start_time = time.time()
-
-        # Validate input
+        logger.info(f"[INFO] Content type: {data.content_type}")
+        
         if not data.queries or all(not q.strip() for q in data.queries):
-            raise HTTPException(status_code=400, detail="At least one non-empty query is required")
+            raise HTTPException(status_code=400, detail="At least one query is required")
 
         aggregator = NewsAggregator()
+        domains = [d for d in data.domains or [] if d.strip()]
+        exclude_domains = [d for d in data.exclude_domains or [] if d.strip()]
+        country = data.country or ['us']
 
-        # Làm sạch dữ liệu nếu có giá trị rỗng
-        domains = [d for d in data.domains if d.strip()] if data.domains else None
-        exclude_domains = [d for d in data.exclude_domains if d.strip()] if data.exclude_domains else None
-        country = data.country if data.country else ['us']
-
-        # Chạy trong thread pool để tránh block main thread
         loop = asyncio.get_event_loop()
-        articles = await loop.run_in_executor(
-            None,
-            lambda: aggregator.get_multiple_queries_articles(
-                data.queries,
-                lang=data.lang,
-                max=data.max,
-                country=country,
-                from_date=data.from_date,
-                to_date=data.to_date,
-                domains=domains,
-                exclude_domains=exclude_domains
-            )
-        )
+        raw_articles = await loop.run_in_executor(None, lambda: aggregator.get_multiple_queries_articles(
+            data.queries,
+            lang=data.lang,
+            max=data.max,
+            country=country,
+            from_date=data.from_date,
+            to_date=data.to_date,
+            domains=domains,
+            exclude_domains=exclude_domains
+        ))
 
-        if not articles:
+        if not raw_articles:
             logger.warning("No articles found")
             return []
 
-        urls = [a['url'] for a in articles]
+        raw_articles = raw_articles[:20]  # limit max 20 articles
+        logger.info(f"Processing {len(raw_articles)} articles")
         
-        # Giới hạn số lượng URLs để tránh timeout
-        max_urls = min(len(urls), 20)  # Giới hạn 20 URLs
-        urls = urls[:max_urls]
-        articles = articles[:max_urls]
-
-        contents = await loop.run_in_executor(
-            None,
-            lambda: get_content_from_urls(urls, content_type=data.content_type)
+        extractor = ContentExtractor(
+            content_type=data.content_type,
+            return_html=data.return_html,
+            return_images=data.return_images
         )
-
-        for i, article in enumerate(articles):
-            article["content"] = contents[i] if i < len(contents) else ""
-
-        duration = time.time() - start_time
-        logger.info(f"Processing completed in {duration:.2f} seconds")
-
-        # Tạo danh sách bài viết chỉ gồm các trường cần thiết
-        table_articles = [
-            {
-                "title": a.get("title", ""),
-                "source": a.get("source", ""),
-                "content": a.get("content", "")
-            }
-            for a in articles
-        ]
-
-        return table_articles
+        
+        enhanced_articles = await loop.run_in_executor(
+            None, 
+            lambda: [extractor.extract(a) for a in raw_articles]
+        )
+        
+        logger.info(f"Enhanced {len(enhanced_articles)} articles")
+        return enhanced_articles
 
     except Exception as e:
         logger.error(f"Error in crawl_news: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-# Thêm exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logger.error(f"Global exception: {str(exc)}")
     return {"error": "Internal server error", "detail": str(exc)}
 
-# Main runner
 if __name__ == "__main__":
     import uvicorn
     import os
